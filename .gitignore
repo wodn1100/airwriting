@@ -7,6 +7,9 @@ __pycache__/
 data/airwriting_dataset.csv
 data/cnn_model.pth
 data/labels.json
+data/mobile_custom_actions.json
+data/mobile_latest_sample.json
+config/system.local.yaml
 node_modules/
 dist/
 .DS_Store

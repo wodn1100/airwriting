@@ -1,1 +1,0 @@
-"""AirWriting IMU-Only System"""

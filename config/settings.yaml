@@ -1,0 +1,78 @@
+# AirWriting 시스템 설정 (v4.0)
+
+system:
+  sampling_rate: 100       # Hz
+  udp_port: 12345          # ESP → PC/Jetson IMU 데이터 수신
+  discovery_port: 12344    # ESP 자동 탐색
+  websocket_port: 8765     # Python → Web 브라우저
+
+sensors:
+  S1:
+    role: forearm            # 팔뚝
+    type: mpu6050
+    bus: 0
+    address: 0x68
+    sample_rate_hz: 100
+  S2:
+    role: hand               # 손등
+    type: mpu6050
+    bus: 0
+    address: 0x69
+    sample_rate_hz: 100
+  S3:
+    role: finger             # 손가락
+    type: icm20948
+    bus: 1
+    address: 0x68
+    sample_rate_hz: 100
+    has_magnetometer: true
+
+skeleton_chain:
+  - joint: forearm
+    sensor: S1
+    bone_length_m: 0.087       # S1→S2 실측: 87mm
+    offset_mm: [-44, 20, 229]  # S3 기준 S1 센서 위치
+    parent: null
+  - joint: hand
+    sensor: S2
+    bone_length_m: 0.148       # S2→S3 실측: 148mm
+    offset_mm: [-29, 23, 143]  # S3 기준 S2 센서 위치
+    parent: forearm
+  - joint: finger
+    sensor: S3
+    bone_length_m: 0.025       # S3→fingertip: ~25mm
+    offset_mm: [0, 0, 0]       # 원점
+    parent: hand
+
+calibration:
+  static_duration_sec: 3     # 정지 바이어스 측정 시간
+  figure8_duration_sec: 10   # 8자 캘리브레이션 시간
+  auto_bias: true
+
+fusion:
+  filter_type: madgwick      # madgwick / kalman / complementary
+  madgwick_beta: 0.1
+  lpf_cutoff_hz: 20          # 저역 통과 필터 차단 주파수
+  accel_noise_std: 0.5
+  gyro_noise_std: 0.01
+  zupt:
+    enabled: true
+    gyro_threshold: 0.05     # rad/s
+    accel_threshold: 0.3     # m/s² (gravity 제외)
+
+inference:
+  model_path: "models/airwriting_attn.onnx"
+  threshold: 0.85
+  min_stroke_length: 10
+  classes: ["0","1","2","3","4","5","6","7","8","9",
+            "ㄱ","ㄴ","ㄷ","ㄹ","ㅁ","ㅂ","ㅅ","ㅇ","ㅈ","ㅊ","ㅋ","ㅌ","ㅍ","ㅎ",
+            "ㅏ","ㅓ","ㅗ","ㅜ","ㅡ","ㅣ", "<ERASE>"]
+
+network:
+  ports:
+    discovery: 12344
+    esp_receive: 12345
+    unity_send: 12346
+    web_ui: 12348
+    phone: 12349
+    python_control: 12350

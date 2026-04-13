@@ -1,7 +1,0 @@
-{
-  "n_samples": 66344,
-  "window_size": 20,
-  "n_features": 6,
-  "n_stationary": 33172,
-  "n_moving": 33172
-}

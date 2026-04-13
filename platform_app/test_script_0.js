@@ -1,1 +1,0 @@
-mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { primaryColor: '#1e293b', primaryTextColor: '#f8fafc', primaryBorderColor: '#334155', lineColor: '#64748b', secondaryColor: '#0f172a', tertiaryColor: '#1e293b' } });
