@@ -147,6 +147,10 @@ class AirWritingSerialPipeline:
         self.yaw_offset = 0.0
         self._ws_loop: asyncio.AbstractEventLoop = None
 
+        # ── Relative Projection 상태 추적 ──
+        self.q_start_writing = None
+        self._prev_is_writing = False
+
         # ── 콜백 ──
         self.on_frame: callable = None
 
@@ -158,7 +162,8 @@ class AirWritingSerialPipeline:
         """웹 클라이언트로부터의 명령 처리."""
         if cmd == "reset_yaw":
             self.yaw_offset = getattr(self, 'current_yaw', 0.0)
-            logger.info(f"🎯 Yaw reference reset by Web UI (Z key)! New offset: {self.yaw_offset:.2f} rad")
+            self._trigger_super_z = True
+            logger.info(f"🎯 3D Super Z-calibration triggered (UI Z key)!")
         elif cmd == "reload_model":
             if hasattr(self, 'inference_engine') and hasattr(self.inference_engine, 'reload_model'):
                 self.inference_engine.reload_model()
@@ -220,35 +225,11 @@ class AirWritingSerialPipeline:
         # ── 2. 바이어스 보정 ──
         packet = apply_bias(packet, self._calibration_result)
 
-        # ── 3. 자동 영점 캘리브레이션 (Auto Zero-Velocity Bias) ──
-        # 사용자가 캘리브레이션을 스킵(--no-calibration) 했어도, 
-        # 글씨를 멈추고 0.5초 대기하면 자이로 편차를 계산해 백그라운드 오프셋을 자동 갱신합니다.
-        if not hasattr(self, 'auto_gyro_bias'):
-            self.auto_gyro_bias = np.zeros(3)
-            self.gyro_history = []
-
-        if not self.trajectory.is_writing:
-            self.gyro_history.append(packet.s3.gyro)
-            if len(self.gyro_history) > 50:
-                self.gyro_history.pop(0)
-
-            # 50프레임(0.5초) 정지 확인
-            if len(self.gyro_history) == 50:
-                recent_gyro = np.array(self.gyro_history)
-                # 최대 표준편차(흔들림)가 0.05 rad/s 미만이면 완전히 멈춘 것으로 간주
-                if np.max(np.abs(np.std(recent_gyro, axis=0))) < 0.05:
-                    mean_gyro = np.mean(recent_gyro, axis=0)
-                    # 기존 자동 바이어스를 서서히 이동 (Low-pass filter 적용)
-                    self.auto_gyro_bias = self.auto_gyro_bias * 0.9 + mean_gyro * 0.1
-        else:
-            self.gyro_history.clear()
-
-        # property('gyro')에 직접 할당할 수 없으므로 개별 축에서 감산
-        packet.s3.gx -= self.auto_gyro_bias[0]
-        packet.s3.gy -= self.auto_gyro_bias[1]
-        packet.s3.gz -= self.auto_gyro_bias[2]
-
-        # ── 4. 저역 통과 필터링 ──
+        # ── 3. 저역 통과 필터링 ──
+        # NOTE: 자동 자이로 바이어스 보정은 OP-1F 모델에서 제거됨.
+        # OP-1F는 적분을 사용하지 않고 Madgwick AHRS의 gradient descent가
+        # 자체적으로 자이로 드리프트를 보정하므로, 외부 바이어스 감산은
+        # Madgwick의 수렴을 방해하여 오히려 비틀림을 악화시킴.
         s1_accel = self.lpf_s1_accel.update(packet.s1.accel)
         s1_gyro = self.lpf_s1_gyro.update(packet.s1.gyro)
         s2_accel = self.lpf_s2_accel.update(packet.s2.accel)
@@ -256,7 +237,7 @@ class AirWritingSerialPipeline:
         s3_accel = self.lpf_s3_accel.update(packet.s3.accel)
         s3_gyro = self.lpf_s3_gyro.update(packet.s3.gyro)
 
-        # ── 4. AHRS 쿼터니언 추정 ──
+        # ── 4. AHRS 쿼터니언 추정 ──  (기존 §4는 §3으로 병합)
         if self._frame_count % 100 == 0:
             logger.info(
                 f"🔍 S3 raw → accel={s3_accel}, gyro={s3_gyro}, mag={packet.s3.mag}"
@@ -279,20 +260,59 @@ class AirWritingSerialPipeline:
 
         q_s3_ray = self.madgwick_s3_ray.update_imu(s3_accel, s3_gyro)
 
-        # 6.4 구면 정사영 투영 (Orthographic Ray Cast)
-        # 평면 투영(1/fy) 방식의 무한 스케일 확장을 방지하는 절대 길이 1.0 매핑
-        
-        # User manual Yaw Reset 적용 (Z키)
-        r, p, y = quat.to_euler(q_s3_ray)
-        self.current_yaw = y
-        q_drift_free = quat.from_euler(r, p, y - self.yaw_offset)
-        
-        forward_local = np.array([0.0, -1.0, 0.0])
-        forward_world = quat.rotate_vector(forward_local, q_drift_free)
+        # 6.4 구면 정사영 투영 (Orthographic Ray Cast) & 오토 영점 캘리브레이션 (판서 모드)
+        current_is_writing = (packet.button > 0)
+        forward_local = np.array([0.0, -1.0, 0.0])  # 센서의 앞면
 
-        # X: 좌우, Z: 상하
-        ray_x = forward_world[0]
-        ray_z = forward_world[2]
+        # 사용자가 Z키(또는 리셋)를 눌러서 3D 영점 초기화를 요청한 경우
+        if getattr(self, '_trigger_super_z', False):
+            self.q_start_writing = q_s3_ray.copy()
+            self.one_euro_filter.reset()
+
+            # ── 화면 기저 벡터(Screen Basis) 계산 ──
+            # 캘리브레이션 자세의 포인팅 방향을 기준으로,
+            # 월드 수직(중력 반대)과 교차곱하여 화면의 가로/세로 축을 정의.
+            # → 센서가 어떻게 기울어져 있어도 화면 좌표는 항상 수평/수직 보장.
+            f_start = quat.rotate_vector(forward_local, q_s3_ray)
+            world_up = np.array([0.0, 0.0, 1.0])
+
+            screen_right = np.cross(world_up, f_start)
+            norm_r = np.linalg.norm(screen_right)
+            if norm_r > 1e-6:
+                screen_right /= norm_r
+            else:
+                screen_right = np.array([1.0, 0.0, 0.0])
+
+            screen_up = np.cross(f_start, screen_right)
+            norm_u = np.linalg.norm(screen_up)
+            if norm_u > 1e-6:
+                screen_up /= norm_u
+            else:
+                screen_up = np.array([0.0, 0.0, 1.0])
+
+            self._screen_right = screen_right
+            self._screen_up = screen_up
+            self._trigger_super_z = False
+
+
+
+        if self.q_start_writing is not None:
+            # ── 월드 좌표 정사영 (World-Aligned Orthographic Projection) ──
+            # 현재 포인팅 방향을 월드 좌표의 화면 기저 벡터에 dot하여
+            # 화면 좌우(ray_x)와 상하(ray_z)를 직접 계산.
+            # 로컬 좌표계를 거치지 않으므로 센서 기울기에 의한 비틀림이 원천 차단됨.
+            forward_current = quat.rotate_vector(forward_local, q_s3_ray)
+            ray_x = float(np.dot(forward_current, self._screen_right))
+            ray_z = float(np.dot(forward_current, self._screen_up))
+
+        else:
+            # 부팅 직후 아직 아무 영점도 안 잡았을 때 (기존 방식 1회용)
+            r, p, y = quat.to_euler(q_s3_ray)
+            self.current_yaw = y
+            q_drift_free = quat.from_euler(r, p, y - self.yaw_offset)
+            forward_world = quat.rotate_vector(forward_local, q_drift_free)
+            ray_x = forward_world[0]
+            ray_z = forward_world[2]
 
         # 1-Euro Filter 적용 (미세한 손떨림은 완전히 굳히고, 빠른 스윙은 지연 없이)
         smoothed_ray = self.one_euro_filter.update(np.array([ray_x, ray_z]))
